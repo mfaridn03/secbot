@@ -1,0 +1,265 @@
+import asyncio
+
+import discord
+
+from datetime import datetime
+from discord.ext import commands
+
+
+class Server(commands.Cog, name='Server Management'):
+    def __init__(self, bot):
+        self.bot = bot
+        self.image_only_emote = '⭕'  # Circle
+        self.q_only_emote = '🔺'  # Triangle
+        self.both_types_emote = '🔰'  # What
+
+    def _past_setup_check(self, ctx, column):
+        statement = f"SELECT {column} FROM guild_info WHERE guild_id={ctx.guild.id}"
+        c = self.bot.execute(statement)
+        if c.fetchone:
+            return True
+        return False
+
+    def _set_guild_security(self, ctx, type_: int):
+        # security_type column
+        check = self._past_setup_check(ctx, 'security_type')
+        if check:
+            self.bot.execute(
+                "UPDATE guild_info SET security_type={} WHERE guild_id={}"
+                    .format(type_, ctx.guild.id)
+            )
+        else:
+            self.bot.execute(
+                "INSERT INTO guild_info (guild_id, security_type) VALUES ({}, {})"
+                    .format(ctx.guild.id, type_)
+            )
+        self.bot.commit()
+
+    def _set_log_channel(self, ctx, channel: int = None):
+        # log_channel column
+        check = self._past_setup_check(ctx, 'log_channel')
+        if check:
+            if not channel:
+                self.bot.execute(
+                    "DELETE FROM guild_info WHERE guild_id={}"
+                        .format(ctx.guild.id)
+                )
+            else:
+                self.bot.execute(
+                    "UPDATE guild_info SET log_channel={} WHERE guild_id={}"
+                        .format(channel, ctx.guild.id)
+                )
+        else:
+            self.bot.execute(
+                "INSERT INTO guild_info (guild_id, log_channel) VALUES ({}, {})"
+                    .format(ctx.guild.id, channel)
+            )
+        self.bot.commit()
+
+    def _set_guild_log(self, ctx, *types):
+        # log_type column
+        t = '|'.join(types)
+        check = self._past_setup_check(ctx, 'log_type')
+        if check:
+            self.bot.execute(
+                "UPDATE guild_info SET log_type={} WHERE guild_id={}"
+                    .format(t, ctx.guild.id)
+            )
+        else:
+            self.bot.execute(
+                "INSERT INTO guild_info (guild_id, log_type) VALUES ({}, {})"
+                    .format(ctx.guild.id, t)
+            )
+        self.bot.commit()
+
+    @commands.has_permissions(administrator=True)
+    @commands.group(name='setup')
+    async def _setup(self, ctx):
+        if ctx.invoked_subcommand is None:
+            return await ctx.send(
+                'No such setup. Do `s!help setup` for more info.'
+            )
+
+    @_setup.command(name='captcha')
+    async def captcha(self, ctx):
+        emb = discord.Embed(
+            title='Captcha Setup',
+            colour=discord.Colour.red(),
+            timestamp=datetime.utcnow()
+        )
+        emb.description = f"""
+The bot currently supports 3 types of captcha verification:
+- Image captcha
+- Simple questions
+- A combination of both
+
+**__React to an emote to select the following security options. You have 15 seconds.__**
+Image only: {self.image_only_emote}
+Question only: {self.q_only_emote}
+Both: {self.both_types_emote}
+            """
+        reaction_dict = {
+            self.image_only_emote: [1, "Image only"],
+            self.q_only_emote: [2, "Question only"],
+            self.both_types_emote: [3, "Image & Question"]
+        }
+        info_msg = await ctx.send(embed=emb)
+
+        def check(r, u):
+            return (
+                    u == ctx.author and
+                    str(r.emoji) in [
+                        self.image_only_emote,
+                        self.q_only_emote,
+                        self.both_types_emote
+                    ] and
+                    r.message == info_msg
+            )
+
+        try:
+            reaction, user = self.bot.wait_for(
+                'reaction_add',
+                check=check,
+                timeout=15
+            )
+        except asyncio.TimeoutError:
+            await info_msg.delete()
+            return await ctx.send('Timeout', delete_after=5)
+        else:
+            await self._set_guild_security(ctx, reaction_dict[str(reaction.emoji)][0])
+
+        await ctx.send(
+            f"Done! Set security type to: `{reaction_dict[str(reaction.emoji)][1]}`"
+        )
+        await info_msg.delete()
+
+    @_setup.command(name='log')
+    async def log(self, ctx):
+        emb = discord.Embed(
+            title='Logging setup',
+            colour=discord.Colour.blue(),
+            timestamp=datetime.utcnow()
+        )
+        emb.description = f"""
+__This bot supports logging for the following events:__
+
+    1. Member update (e.g. avatar/nickname/username change, member ban/unban)
+    2. Guild update (e.g. channel edit, category creation/deletion)
+    3. Message update (e.g. message edit/delete)
+    4. Reactions (e.g. reaction add, remove [this will be in a separate #reaction-logs channel])
+
+*React*
+**Do you want to setup logging for all events (🇦) or only specific event/s? (🇧)**
+        """
+        info_msg = await ctx.send(embed=emb)
+        await info_msg.add_reaction('🇦')
+        await info_msg.add_reaction('🇧')
+
+        react_dict = {
+            '🇦': 1,
+            '🇧': 2
+        }
+
+        def check(r, u):  # Check function -> ensure message author is the reactor
+            return (
+                    u == ctx.author and
+                    str(r.emoji) in react_dict.keys() and
+                    r.message == info_msg
+            )
+
+        try:
+            reaction, user = self.bot.wait_for(
+                'reaction_add',
+                check=check,
+                timeout=20
+            )
+        except asyncio.TimeoutError:  # Took too long (>20 seconds)
+            await info_msg.delete()
+            return await ctx.send("Timeout", delete_after=5)
+
+        if react_dict[str(reaction.emoji)] == 1:  # All events
+            emb.description = """
+**Done! Now wait while the bot sets up the log channels**
+            """
+            await info_msg.edit(
+                content=None,
+                embed=emb
+            )
+            await self._set_guild_log(ctx, ['all'])
+            return await info_msg.delete()
+
+        else:  # Not all events are logged
+            await info_msg.clear_reactions()
+
+            emb.colour = 0x000000
+            emb.set_footer(text='You have 15 seconds')
+            emb.description = """
+Please react to the emotes to specify what should be logged.
+You can remove your reaction and that event will not be logged
+
+**Reactions:**
+    🍌 = Member Updates
+    🍉 = Guild Updates
+    🍇 = Message Updates
+    🍓 = Reaction Updates
+            """
+            await info_msg.edit(
+                content=None,
+                embed=emb
+            )
+            react_dict2 = {
+                '🍌': 'member',
+                '🍉': 'guild',
+                '🍇': 'message',
+                '🍓': 'reaction'
+            }
+            emote_list = '🍌 🍉 🍇 🍓 🍈 🍒 🍑 🍍'.split()
+            for emote in emote_list:
+                await info_msg.add_reaction(emote)
+            await asyncio.sleep(15)  # We wait for the user to pick
+
+            reacted = [
+                str(r.emoji) for r in info_msg.reactions if
+                (
+                        ctx.author in set(await r.users().flatten()) and
+                        str(r.emoji) in emote_list
+                )
+            ]  # Will return a list of emojis reacted
+
+            if not reacted:  # No emotes were reacted
+                emb = discord.Embed(title=discord.Embed.Empty)
+                emb.description = 'None reacted. Exiting setup...'
+                emb.set_footer(text='You can do this setup again')
+                await info_msg.edit(
+                    content=None,
+                    embed=emb
+                )
+                await asyncio.sleep(3)
+                return await info_msg.delete()
+
+            else:
+                log_types = [
+                    react_dict2[r] for r in reacted
+                ]
+                self._set_guild_log(ctx, log_types)
+                await info_msg.delete()
+                n = '\n'  # Because no backslashes in expressions within f-strings
+                return await ctx.send(f"Done! These will now be logged: \n```{n.join(log_types)}````")
+
+    @_setup.command(name='log_channel')
+    async def log_channel(self, ctx, channel):
+        """
+        Sets the log channel
+        To remove log channel (or disable it), do s!setup log_channel disable
+        """
+
+        if channel.lower() == 'disable':
+            self._set_log_channel(ctx)
+
+        try:
+            selected_channel = await commands.TextChannelConverter().convert(ctx, channel)
+        except commands.BadArgument:
+            return await ctx.send("Channel not found")
+
+        self._set_log_channel(ctx, selected_channel.id)
+        return await ctx.send(f"Done! Set log channel to {selected_channel.mention}")
